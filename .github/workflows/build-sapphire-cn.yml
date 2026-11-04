@@ -1,0 +1,263 @@
+# Sapphire-cn 中文版：GitHub 云端构建 / Apple Silicon 本机体验版
+#
+# 使用方法：
+# 1. 在自己的公开 fork 中，把本文件保存为 .github/workflows/build-sapphire-cn.yml。
+# 2. 提交到默认分支 main，打开 Actions，启用工作流。
+# 3. 选择 "Build Sapphire CN (Apple Silicon)" -> Run workflow。
+# 4. 成功后在 Artifacts 下载 Sapphire-cn-arm64.dmg；失败则查看构建日志。
+#
+# 状态：已做配置及补丁静态核验，尚未在 GitHub macOS runner 实际构建。
+# 范围：基础界面体验版，使用 ad-hoc 签名，没有 Apple 公证。
+# 系统扩展、App Groups 和需要 root 身份的后台助手不保证可用。
+# 公共源码中的占位功能也不会因为编译成功变成完整实现。
+# 仅手动运行；不需要添加 API Key 或 Apple 开发者证书。
+#
+# 源代码：https://github.com/Gliangquan/Sapphire-cn
+# 固定提交：ff1a7912eb6f6392a501c56c79038258dec8fa97
+# 环境参考：https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md
+
+name: Build Sapphire CN (Apple Silicon)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sapphire-cn-manual-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out the requested Chinese version
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Gliangquan/Sapphire-cn
+          ref: ff1a7912eb6f6392a501c56c79038258dec8fa97
+          path: source
+          persist-credentials: false
+
+      - name: Select Xcode and record the build environment
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/build-logs" "$GITHUB_WORKSPACE/dist"
+          if [ "$(uname -m)" != "arm64" ]; then
+            echo "::error::This workflow requires an Apple Silicon runner."
+            exit 1
+          fi
+          if [ ! -d /Applications/Xcode_26.5.app/Contents/Developer ]; then
+            echo "::error::Xcode 26.5 is not present on this runner image. Check the installed Xcode list before changing this workflow."
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select --switch /Applications/Xcode_26.5.app/Contents/Developer
+          {
+            sw_vers
+            uname -m
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            git -C source rev-parse HEAD
+          } | tee "$GITHUB_WORKSPACE/build-logs/environment.txt"
+
+      - name: Prepare build scripts for a personal build
+        working-directory: source
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+
+          project = pathlib.Path("Sapphire.xcodeproj/project.pbxproj")
+          text = project.read_text(encoding="utf-8")
+
+          # The pinned project stores two shellScript values as line arrays.
+          # Normalize them to the usual Xcode string representation, preserving
+          # each line. This does not execute either script during preparation.
+          script_array = re.compile(
+              r"(?ms)^([ \t]*shellScript = )\(\n(.*?)^[ \t]*\);"
+          )
+
+          def normalize(match):
+              lines = []
+              for line in match.group(2).splitlines():
+                  value = line.strip()
+                  if not value:
+                      continue
+                  if value.endswith(","):
+                      value = value[:-1].rstrip()
+                  decoded = json.loads(value)
+                  if not isinstance(decoded, str):
+                      raise ValueError("Expected a shell script string")
+                  lines.append(decoded)
+              return match.group(1) + json.dumps("\n".join(lines)) + ";"
+
+          text, count = script_array.subn(normalize, text)
+          if count != 2:
+              raise SystemExit(f"Expected 2 script arrays at the pinned commit; found {count}")
+
+          phase = re.compile(
+              r"(?ms)^(\t\tDAC019182E9EA03E00CA587F /\* Upload Crashlytics Symbols \*/ = \{\n)"
+              r"(.*?)"
+              r"(^\t\t\};)"
+          )
+          matches = list(phase.finditer(text))
+          if len(matches) != 1:
+              raise SystemExit("Could not uniquely locate the Crashlytics upload phase")
+          match = matches[0]
+          skipped = (
+              'echo "Skipping Crashlytics symbol upload for this personal build"\n'
+              'touch "$SCRIPT_OUTPUT_FILE_0"\n'
+          )
+          body, replaced = re.subn(
+              r"(?m)^(\t\t\tshellScript = ).*;$",
+              lambda m: m.group(1) + json.dumps(skipped) + ";",
+              match.group(2),
+          )
+          if replaced != 1:
+              raise SystemExit("Could not replace the Crashlytics script")
+          text = (
+              text[:match.start()] + match.group(1) + body + match.group(3)
+              + text[match.end():]
+          )
+          project.write_text(text, encoding="utf-8")
+
+          # A root helper requires an Apple-issued signing identity. Leave its
+          # identity checks intact and do not auto-register it for this preview.
+          app_delegate = pathlib.Path("Sapphire/App/AppDelegate.swift")
+          app_text = app_delegate.read_text(encoding="utf-8")
+          helper_call = "        HelperManager.shared.installIfNeeded()"
+          if app_text.count(helper_call) != 1:
+              raise SystemExit("Unexpected automatic helper registration call count")
+          app_text = app_text.replace(
+              helper_call,
+              "        // Personal preview: no automatic privileged-helper registration.",
+              1,
+          )
+          app_delegate.write_text(app_text, encoding="utf-8")
+          print("Prepared build scripts and disabled automatic privileged-helper registration.")
+          PY
+          plutil -lint Sapphire.xcodeproj/project.pbxproj
+          git diff -- Sapphire.xcodeproj/project.pbxproj Sapphire/App/AppDelegate.swift \
+            > "$GITHUB_WORKSPACE/build-logs/local-build.patch"
+
+      - name: Build an ad-hoc signed arm64 application
+        working-directory: source
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Sapphire.xcodeproj \
+            -scheme Sapphire \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$RUNNER_TEMP/SapphireCN-DerivedData" \
+            -jobs 2 \
+            -hideShellScriptEnvironment \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_ALLOWED=YES \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
+            REGISTER_APP_GROUPS=NO \
+            ENABLE_HARDENED_RUNTIME=NO \
+            OTHER_CODE_SIGN_FLAGS="--timestamp=none" \
+            build 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/xcodebuild.log"
+
+      - name: Verify the application and create a disk image
+        run: |
+          set -euo pipefail
+          sapphire_app="$RUNNER_TEMP/SapphireCN-DerivedData/Build/Products/Debug/Sapphire.app"
+          test -d "$sapphire_app"
+          test -x "$sapphire_app/Contents/MacOS/Sapphire"
+          lipo -verify_arch arm64 "$sapphire_app/Contents/MacOS/Sapphire"
+          # --deep is used for verification only. Xcode performs signing.
+          codesign --verify --deep --strict --verbose=2 "$sapphire_app"
+          codesign --display --verbose=2 "$sapphire_app" 2> "$GITHUB_WORKSPACE/build-logs/signature.txt"
+          python3 - <<'PY'
+          import os
+          import pathlib
+          signature = (
+              pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "build-logs/signature.txt"
+          ).read_text()
+          if "Signature=adhoc" not in signature:
+              raise SystemExit("Expected an ad-hoc signed application; refusing to package.")
+          PY
+
+          sapphire_stage="$RUNNER_TEMP/SapphireCN-Stage"
+          mkdir -p "$sapphire_stage"
+          ditto "$sapphire_app" "$sapphire_stage/Sapphire.app"
+          ln -s /Applications "$sapphire_stage/Applications"
+          cp source/LICENSE "$sapphire_stage/LICENSE.txt"
+          cp "$GITHUB_WORKSPACE/build-logs/local-build.patch" "$sapphire_stage/local-build.patch"
+          cp "$GITHUB_WORKSPACE/build-logs/environment.txt" "$sapphire_stage/build-environment.txt"
+          cat > "$sapphire_stage/使用说明.txt" <<'TEXT'
+          Sapphire-cn 中文版 — Apple Silicon 本机体验构建
+
+          源代码：
+          https://github.com/Gliangquan/Sapphire-cn/tree/ff1a7912eb6f6392a501c56c79038258dec8fa97
+
+          安装：
+          将 Sapphire.app 拖入 Applications（应用程序），然后打开。
+          若已有同名应用，请先退出并保留原版本备份，再决定是否替换。
+          本包使用 ad-hoc 签名，没有 Apple 公证。
+          首次启动可能需要在 macOS 系统设置 > 隐私与安全性中确认打开。
+          若 macOS 明确报告恶意软件或损坏，请保留报错进行排查。
+
+          中文设置：
+          General > System > Language > 简体中文（Simplified Chinese）。
+          已运行时再次打开 Sapphire.app，可尝试调出设置窗口。
+
+          首次运行：
+          按向导授予辅助功能权限，其他权限按实际功能需要选择。
+          后台助手页如无法完成，可选择 Skip for now 先体验主界面。
+
+          更新：
+          设置 > About > Update Preferences。
+          先关闭自动下载，再关闭自动检查；内置更新源仍指向原版仓库。
+          后续中文版本应从中文仓库重新构建。
+
+          功能边界：
+          这是基础界面体验构建，未做交互运行验证。
+          构建时跳过 Crashlytics 符号上传，关闭自动特权助手注册，并采用本机签名配置。
+          系统扩展、App Groups、钥匙串共享和需要 root 的后台助手可能不可用。
+          公开源码中部分高级功能只有占位实现。
+          本次工程补丁和构建环境已附在磁盘映像内。
+          TEXT
+
+          hdiutil create \
+            -volname "Sapphire CN" \
+            -srcfolder "$sapphire_stage" \
+            -format UDZO \
+            -ov "$GITHUB_WORKSPACE/dist/Sapphire-cn-arm64.dmg"
+          shasum -a 256 "$GITHUB_WORKSPACE/dist/Sapphire-cn-arm64.dmg" \
+            > "$GITHUB_WORKSPACE/build-logs/SHA256SUMS.txt"
+
+      - name: Upload the disk image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: dist/Sapphire-cn-arm64.dmg
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Keep logs even when the build fails
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Sapphire-cn-build-logs
+          path: build-logs/
+          if-no-files-found: warn
+          retention-days: 7
