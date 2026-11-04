@@ -182,7 +182,12 @@ jobs:
           sapphire_app="$RUNNER_TEMP/SapphireCN-DerivedData/Build/Products/Debug/Sapphire.app"
           test -d "$sapphire_app"
           test -x "$sapphire_app/Contents/MacOS/Sapphire"
-          lipo -verify_arch arm64 "$sapphire_app/Contents/MacOS/Sapphire"
+          architectures="$(lipo -archs "$sapphire_app/Contents/MacOS/Sapphire")"
+          echo "Sapphire executable architectures: $architectures"
+          if [[ " $architectures " != *" arm64 "* ]]; then
+            echo "::error::Expected arm64 executable; got: $architectures"
+            exit 1
+          fi
           # --deep is used for verification only. Xcode performs signing.
           codesign --verify --deep --strict --verbose=2 "$sapphire_app"
           codesign --display --verbose=2 "$sapphire_app" 2> "$GITHUB_WORKSPACE/build-logs/signature.txt"
